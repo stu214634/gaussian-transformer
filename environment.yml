@@ -1,4 +1,4 @@
-name: gaussian_splatting
+name: gaussian_transformer
 channels:
   - pytorch
   - conda-forge
