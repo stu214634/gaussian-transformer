@@ -1,7 +1,6 @@
-import torch
 import numpy as np
 from torch import nn
-from shared import clones, LayerNorm, SublayerConnection
+from .shared import clones, LayerNorm, SublayerConnection
 
 class Decoder(nn.Module):
     "Generic N layer decoder with masking."

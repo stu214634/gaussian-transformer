@@ -1,5 +1,5 @@
 from torch import nn
-from shared import clones, LayerNorm, SublayerConnection
+from .shared import clones, LayerNorm, SublayerConnection
 
 
 class Encoder(nn.Module):

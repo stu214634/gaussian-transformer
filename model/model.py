@@ -1,10 +1,10 @@
 import copy
 from torch import nn
 from torch.nn import functional as F
-from attention import MultiHeadedAttention, PositionwiseFeedForward
-from encoder import Encoder, EncoderLayer
-from decoder import Decoder, DecoderLayer#
-from shared import Embeddings
+from .attention import MultiHeadedAttention
+from .encoder import Encoder, EncoderLayer
+from .decoder import Decoder, DecoderLayer
+from .shared import Embeddings, PositionwiseFeedForward
 
 
 class EncoderDecoder(nn.Module):
@@ -41,7 +41,7 @@ class Generator(nn.Module):
         return self.proj(x)
     
 
-def make_model(src_g_len=59, tgt_g_len=64, N=6, 
+def make_model(src_g_len=64, tgt_g_len=64, N=6, 
                d_model=64, d_ff=256, h=8, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy

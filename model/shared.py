@@ -50,6 +50,7 @@ class PositionwiseFeedForward(nn.Module):
 class Embeddings(nn.Module):
     def __init__(self, d_model, g_len):
         super(Embeddings, self).__init__()
+        self.d_model = d_model
         self.lin = nn.Linear(g_len, d_model)
 
     def forward(self, x):
