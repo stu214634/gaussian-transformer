@@ -33,6 +33,8 @@ class Scene:
         if load_iteration:
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
+                if not self.loaded_iter:
+                    assert False, "Could not load iter!"
             else:
                 self.loaded_iter = load_iteration
             print("Loading trained model at iteration {}".format(self.loaded_iter))
