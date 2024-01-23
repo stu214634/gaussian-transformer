@@ -41,8 +41,8 @@ class Generator(nn.Module):
         return self.proj(x)
     
 
-def make_model(src_g_len=64, tgt_g_len=64, N=6, 
-               d_model=64, d_ff=256, h=8, dropout=0.1):
+def make_model(src_g_len=64, tgt_g_len=64, N=2, 
+               d_model=64, d_ff=256, h=4, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
