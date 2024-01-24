@@ -201,20 +201,22 @@ class ImageLossCompute:
         gaussian_model_prompt = unflattenGaussians(prompt)
         render_pkg_prompt = render(camera, gaussian_model_prompt, self.pipe, self.bg)
         image_prompt = render_pkg_prompt["render"]
-        gaussian_model = unflattenGaussians(torch.cat([prompt, x], 0))
+        gaussian_model = unflattenGaussians(x)
         render_pkg = render(camera, gaussian_model, self.pipe, self.bg)
         image = render_pkg["render"]
         base = self.criterion(image_prompt, torch.squeeze(y))
-        loss = base - (base - self.criterion(image, torch.squeeze(y)))
+        gen = self.criterion(image, torch.squeeze(y))
+        loss = (base - (base - gen)) / base
         loss.backward()
         if self.opt is not None:
             self.opt.step()
             self.opt.optimizer.zero_grad()
-        writer.add_scalars("base vs. gen", {"base" : base.data.item(), "gen" : loss.data.item()}, global_step)
+        writer.add_scalars("base vs. gen", {"base" : base.data.item(), "gen" : gen.data.item()}, global_step)
+        writer.add_scalar("loss", loss.data.item(), global_step)
         global_step += 1
         if (last):
             writer.add_image("prompt", image_prompt, epoch)
-            writer.add_image("prompt+x", image, epoch)
+            writer.add_image("x", image, epoch)
             writer.add_image("target", torch.squeeze(y), epoch)
         writer.flush()
         return loss.data.item()
@@ -265,7 +267,6 @@ def run_epoch(data_iter, model : EncoderDecoder, loss_compute, iter_size):
         total_tokens += batch["ntokens"]
     
     loss = total_loss / total_tokens
-    writer.add_scalar("loss", loss, epoch)
     return loss
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
@@ -311,19 +312,24 @@ if __name__ == "__main__":
 
 
     V = 64
-    model = make_model(V, V, N=2)
+    model = make_model(V, V, N=3)
+    #model.load_state_dict(torch.load("best_model.pt"))
     model.half()
     model.cuda()
-    model_opt = NoamOpt(model.src_embed[0].d_model, 2, 4000,
+    model_opt = NoamOpt(model.src_embed[0].d_model, 0.5, 4000,
             torch.optim.Adamax(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-4))
     
     
     writer = SummaryWriter('runs/gaussian_trainer')
     global_step = 0 
     model.train()
+    lowest_loss = 1e9
     for epoch in range(20000):
-
-        print(f"Epoch: {epoch} Loss: {run_epoch(tScene.train_iter(), model, ImageLossCompute(model.generator, pp.extract(args), model_opt), tScene.size)}")
+        loss = run_epoch(tScene.train_iter(), model, ImageLossCompute(model.generator, pp.extract(args), model_opt), tScene.size)
+        print(f"Epoch: {epoch} Loss: {loss}")
+        if loss < lowest_loss:
+            lowest_loss = loss
+            torch.save(model.state_dict, "best_model.pt")
         
     # All done
     print("\nTraining complete.")
