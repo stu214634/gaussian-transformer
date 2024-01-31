@@ -10,13 +10,14 @@ from model.model import make_model, EncoderDecoder
 from scene import GaussianModel, Scene
 from gaussian_renderer import render, network_gui
 from torch.utils.tensorboard import SummaryWriter
+import time
 
-START_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
-START_GAUSSIAN[59] = 1
-PAD_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
-PAD_GAUSSIAN[61] = 1
-END_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
-END_GAUSSIAN[63] = 1
+START_GAUSSIAN = torch.zeros(26,dtype=torch.float32)
+START_GAUSSIAN[23] = 1
+PAD_GAUSSIAN = torch.zeros(26,dtype=torch.float32)
+PAD_GAUSSIAN[24] = 1
+END_GAUSSIAN = torch.zeros(26,dtype=torch.float32)
+END_GAUSSIAN[25] = 1
 
 def fuzzy_token_equal(gaussian, token):
     return torch.sum(torch.abs(gaussian - token), -1) <= 0.5
@@ -29,25 +30,26 @@ def flattenGaussians(x : GaussianModel):
     opa = x._opacity
     xyz = x._xyz
     sca = x._scaling
-    flags = torch.zeros((sca.shape[0], 5), device="cuda")
+    flags = torch.zeros((sca.shape[0], 3), device="cuda")
     out = torch.concat((features, rot, opa, xyz, sca, flags), axis=1)
     return out
     
 def unflattenGaussians(x) -> GaussianModel:
-    gaussian_model = GaussianModel(3)
-    features =  x[:, :48].reshape((x.shape[0], 16, 3))
+    gaussian_model = GaussianModel(1)
+    gaussian_model.active_sh_degree = 1
+    features =  x[:, :12].reshape((x.shape[0], 4, 3))
     gaussian_model._features_dc = features[:, 0:1, :]
     gaussian_model._features_rest = features[:, 1:, :]
-    gaussian_model._rotation = x[:, 48:52]
-    gaussian_model._opacity = x[:, 52:53]
-    gaussian_model._xyz = x[:, 53:56]
-    gaussian_model._scaling = x[:, 56: 59]
+    gaussian_model._rotation = x[:, 12:16]
+    gaussian_model._opacity = x[:, 16:17]
+    gaussian_model._xyz = x[:, 17:20]
+    gaussian_model._scaling = x[:, 20: 23]
     return gaussian_model
 
 class TrainingScene:
-    def __init__(self, args, pipe, batch_size = 1, max_len=13_000) -> None:
+    def __init__(self, args, pipe, batch_size = 1, max_len=15_000) -> None:
         self.max_len = max_len
-        self.gaussian_model = GaussianModel(3)
+        self.gaussian_model = GaussianModel(1)
         self.scene = Scene(args, self.gaussian_model, -1)
         self.cameras = self.scene.getTrainCameras()
         pipe.debug = False
@@ -66,12 +68,13 @@ class TrainingScene:
             idxs = self.idxs.pop(0)
             tgt_im = torch.zeros((self.batch_size, 3, self.cameras[0].image_height, self.cameras[0].image_width))
             cameras = []
-            tgt_gaussians = torch.zeros((self.batch_size, int(torch.max(self.visible_gaussians[idxs]+2,0)[0] * self.dropout * 1.1), 64))
-            src_gaussians = torch.zeros((self.batch_size, int(torch.max(self.visible_gaussians[idxs]+2,0)[0] * (1-self.dropout) * 1.1), 64))
+            tgt_gaussians = torch.zeros((self.batch_size, int(torch.max(self.visible_gaussians[idxs]+2,0)[0] * self.dropout * 1.1), 26))
+            src_gaussians = torch.zeros((self.batch_size, int(torch.max(self.visible_gaussians[idxs]+2,0)[0] * (1-self.dropout) * 1.1), 26))
             tgt_gaussians[:, :] = PAD_GAUSSIAN
             src_gaussians[:, :] = PAD_GAUSSIAN
             tgt_gaussians[:, 0] = src_gaussians[:, 0] = START_GAUSSIAN
             gaussian_list = flattenGaussians(self.gaussian_model)
+            #re_gaussianed = unflattenGaussians(gaussian_list)
             tokens = 0
             for i in range(self.batch_size):
                 render_pkg = render(self.cameras[idxs[i]], self.gaussian_model, self.pipe, self.bg)
@@ -119,7 +122,7 @@ class TrainingScene:
             render_pkg = render(self.cameras[i], self.gaussian_model, self.pipe, self.bg)
             _, _, visibility_filter, _ = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             count = len(visibility_filter[visibility_filter])
-            if count+1 >= self.max_len:
+            if count+1 >= self.max_len or count == 0:
                 too_large.append(i)
                 continue
             self.visible_gaussians.append(count)
@@ -194,30 +197,40 @@ class ImageLossCompute:
         self.bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
         self.opt = opt
         
-    def __call__(self, prompt, x, y, camera, norm, last):
+    def __call__(self, prompt, x, y, tgt, camera):
         global global_step
         x = torch.squeeze(self.generator(x)).float()
         prompt = prompt.float()
         gaussian_model_prompt = unflattenGaussians(prompt)
         render_pkg_prompt = render(camera, gaussian_model_prompt, self.pipe, self.bg)
         image_prompt = render_pkg_prompt["render"]
-        gaussian_model = unflattenGaussians(x)
+
+        gaussian_model = unflattenGaussians(torch.cat([prompt, x],  0))
         render_pkg = render(camera, gaussian_model, self.pipe, self.bg)
         image = render_pkg["render"]
-        base = self.criterion(image_prompt, torch.squeeze(y))
-        gen = self.criterion(image, torch.squeeze(y))
-        loss = (base - (base - gen)) / base
+
+        original_image = camera.original_image.cuda()
+        base = self.criterion(torch.squeeze(y), original_image)
+        prompt = self.criterion(image_prompt, original_image)
+        gen = self.criterion(image, original_image)
+        fut = torch.nn.functional.mse_loss(x , torch.squeeze(tgt).float())
+        loss = ((base - (base - gen)) / base)*0.5
+        loss += 0.5*fut
+
         loss.backward()
         if self.opt is not None:
             self.opt.step()
             self.opt.optimizer.zero_grad()
-        writer.add_scalars("base vs. gen", {"base" : base.data.item(), "gen" : gen.data.item()}, global_step)
+        writer.add_scalars("base vs. prompt vs. gen", {"base" : base.data.item(), "prompt" : prompt.data.item(), "gen" : gen.data.item()}, global_step)
+        writer.add_scalar("fut_loss", fut.data.item(), global_step)
         writer.add_scalar("loss", loss.data.item(), global_step)
+        writer.add_scalar("lr", self.opt.rate(), global_step)
         global_step += 1
-        if (last):
-            writer.add_image("prompt", image_prompt, epoch)
-            writer.add_image("x", image, epoch)
-            writer.add_image("target", torch.squeeze(y), epoch)
+        if (global_step % 5 == 0):
+            writer.add_image("prompt", image_prompt, global_step)
+            writer.add_image("prompt + x", image, global_step)
+            writer.add_image("base", torch.squeeze(y), global_step)
+            writer.add_image("target", original_image, global_step)
         writer.flush()
         return loss.data.item()
     
@@ -230,19 +243,17 @@ def closestFuture(pred, tgt):
 def closestFuturesLoss(pred, tgt):
     tgtReorder = torch.empty_like(tgt)
     for i in range(pred.shape[0]):
-        idxs = torch.empty(pred.shape[1], dtype=torch.long) 
+        idxs = torch.empty(pred.shape[1], dtype=torch.long).cuda()
         idxs = torch.fill(idxs, tgt.shape[1] + 2)
         rPred, rTgt = pred[i], tgt[i]
+        mask = torch.ones(rPred.shape[:-1], dtype=torch.bool)
         for j in range(pred.shape[1]):
-            mask = torch.ones(rPred.shape[:-1], dtype=torch.bool)
-            _, idx = closestFuture(rPred[0:1], rTgt)
-            rPred = rPred[1:]
-            mask[idx] = False
-            rTgt = rTgt[mask].reshape(rPred.shape[0], rPred.shape[1])
+            _, idx = closestFuture(rPred[j:j+1], rTgt[mask].reshape(-1, rPred.shape[1]))
             idx += len(idxs[idxs <= idx])
-            while len(idxs[idxs == idx]) > 0:
+            while not mask[idx]:
                 idx += 1
             idxs[j] = idx
+            mask[idx] = False
             
         tgtReorder[i] = tgt[i][idxs]
     return torch.nn.functional.l1_loss(pred, tgtReorder)
@@ -262,7 +273,7 @@ def run_epoch(data_iter, model : EncoderDecoder, loss_compute, iter_size):
         out = model.forward(batch["src"], batch["trg"], 
                             batch["src_mask"], batch["trg_mask"])
         image = batch["trg_im"]
-        loss = loss_compute(torch.squeeze(batch["src"]), out, image, batch["cam"][0], batch["ntokens"], i == iter_size-1)
+        loss = loss_compute(torch.squeeze(batch["src"]), out, image, batch["trg_y"], batch["cam"][0])
         total_loss += loss
         total_tokens += batch["ntokens"]
     
@@ -311,17 +322,18 @@ if __name__ == "__main__":
 
 
 
-    V = 64
-    model = make_model(V, V, N=3)
+    V = 26
+    model = make_model(V, V, N=2)
     #model.load_state_dict(torch.load("best_model.pt"))
     model.half()
     model.cuda()
     model_opt = NoamOpt(model.src_embed[0].d_model, 0.5, 4000,
             torch.optim.Adamax(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-4))
     
+    model.load_state_dict(torch.load("best_model.pt"))
     
-    writer = SummaryWriter('runs/gaussian_trainer')
-    global_step = 0 
+    writer = SummaryWriter('runs/gaussian_trainer_2')
+    global_step = 5_802
     model.train()
     lowest_loss = 1e9
     for epoch in range(20000):
@@ -329,7 +341,7 @@ if __name__ == "__main__":
         print(f"Epoch: {epoch} Loss: {loss}")
         if loss < lowest_loss:
             lowest_loss = loss
-            torch.save(model.state_dict, "best_model.pt")
+            torch.save(model.state_dict(), "best_model.pt")
         
     # All done
     print("\nTraining complete.")
