@@ -1,4 +1,5 @@
 import copy
+import math
 import torch
 import numpy as np
 from torch import nn
@@ -47,15 +48,27 @@ class PositionwiseFeedForward(nn.Module):
     def forward(self, x):
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
     
-class Embeddings(nn.Module):
-    def __init__(self, d_model, g_len):
-        super(Embeddings, self).__init__()
-        self.d_model = d_model
-        self.lin = nn.Linear(g_len, d_model)
+class Interleave(nn.Module):
+    def __init__(self) -> None:
+        super(Interleave, self).__init__()
+    
+    def forward(self, x):
+        return torch.cat((x[:, 0::2], x[:, 1::2]), -1)
 
+class Unravel(nn.Module):
+    def __init__(self) -> None:
+        super(Interleave, self).__init__()
+    
+    def forward(self, x):
+        return x.reshape(x.shape[0], x.shape[1]*2, x.shape[2]//2)
+class Embeddings(nn.Module):
+    def __init__(self, d_in, d_out):
+        super(Embeddings, self).__init__()
+        self.lin = nn.Linear(d_in, d_out)
+        
     def forward(self, x):
         return self.lin(x)
-    
+
 def subsequent_mask(size):
     "Mask out subsequent positions."
     attn_shape = (1, size, size)
