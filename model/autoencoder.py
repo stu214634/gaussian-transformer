@@ -1,15 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from .shared import LayerNorm
 class GAutoEncoder(nn.Module):
     def __init__(self) -> None:
         super(GAutoEncoder, self).__init__()
         self.encoder = GEncoder()
         self.decoder = GDecoder(self.encoder.d_model)
+        self.dropout = nn.Dropout(0.1)
 
-    def forward(self, x):
-        features, residuals = self.encoder(x)
+    def forward(self, xX, xY, xZ):
+        xX = self.dropout(xX)
+        xZ = self.dropout(xZ)
+        xY = self.dropout(xY)
+        features, residuals = self.encoder(xX, xY, xZ)
         return self.decoder(features, residuals)
 
 
@@ -18,6 +22,7 @@ class FeatureBlock(nn.Module):
         super(FeatureBlock, self).__init__()
         self.layers = nn.Sequential()
         self.d_out = d_in*2**N
+        self.layers.add_module("reduce_in", nn.Conv1d(d_in, d_in, 5, 4, 2))
         for i in range(N):
             self.layers.add_module(f"block_{i}", self.makeBlock(d_in*2**i))
 
@@ -28,7 +33,7 @@ class FeatureBlock(nn.Module):
         for i in range(n):
             block.add_module(f"c_{i}", nn.Conv1d(d_out, d_out, 3, 1, "same"))
             block.add_module(f"a_{i}", nn.SiLU())
-            block.add_module(f"n_{i}", nn.BatchNorm1d(d_out))
+        block.add_module("norm", LayerNorm(d_out, dim=1))
         return block
         
     def forward(self, x):
@@ -48,7 +53,7 @@ class UBlock(nn.Sequential):
         for i in range(n):
             block.add_module(f"c_{i}", nn.Conv2d(d_in, d_in, 3, 1, "same"))
             block.add_module(f"a_{i}", nn.SiLU())
-            block.add_module(f"n_{i}", nn.BatchNorm2d(d_in))
+        block.add_module("norm", LayerNorm(d_in, dim=1))
         return block
 
          
@@ -61,17 +66,12 @@ class GEncoder(nn.Module):
         self.d_model = self.fBlockX.d_out
         self.uBlock = UBlock(self.d_model)
         self.reduce = nn.Conv2d(self.d_model, self.d_model, (3, 1), 1, "valid")
-        self.dropout = nn.Dropout(0.1)
 
-    def forward(self, x):
+    def forward(self, xX, xY, xZ):
         residuals = []
-        idxsX = torch.squeeze(torch.argsort(x[:, :, 17]))
-        idxsY = torch.squeeze(torch.argsort(x[:, :, 18]))
-        idxsZ = torch.squeeze(torch.argsort(x[:, :, 19]))
-        x = self.dropout(x)
-        featX = torch.unsqueeze(self.fBlockX(x[:, idxsX]), 2)
-        featY = torch.unsqueeze(self.fBlockX(x[:, idxsY]), 2)
-        featZ = torch.unsqueeze(self.fBlockX(x[:, idxsZ]), 2)
+        featX = torch.unsqueeze(self.fBlockX(xX), 2)
+        featY = torch.unsqueeze(self.fBlockX(xY), 2)
+        featZ = torch.unsqueeze(self.fBlockX(xZ), 2)
         features = torch.cat([featX, featY, featZ], 2)
         for _, module in enumerate(self.uBlock):
             residuals.append(features)
@@ -100,7 +100,9 @@ class ReconBlock(nn.Module):
         self.d_out = d_in//2**N
         for i in range(N):
             self.layers.add_module(f"block_{i}", self.makeBlock(d_in//2**i))
-        self.layers = nn.Sequential(self.layers)
+        self.layers.add_module("c_expand", nn.Conv1d(self.d_out, self.d_out*4, 1, 1))
+        self.layers.add_module("unshuffle_1", GaussianUnshuffle1D())
+        self.layers.add_module("unshuffle_2", GaussianUnshuffle1D())
 
     def makeBlock(self, d_in, n=5):
         block = nn.Sequential()
@@ -108,7 +110,7 @@ class ReconBlock(nn.Module):
         for i in range(n):
             block.add_module(f"c_{i}", nn.Conv1d(d_in//2, d_in//2, 3, 1, "same"))
             block.add_module(f"a_{i}", nn.SiLU())
-            block.add_module(f"n_{i}", nn.BatchNorm1d(d_in//2))
+        block.add_module("norm", LayerNorm(d_in//2, dim=1))
         return block
         
     def forward(self, x):
@@ -126,7 +128,7 @@ class CBlock(nn.Sequential):
         for i in range(n):
             block.add_module(f"c_{i}", nn.Conv2d(d_in, d_in, 3, 1, "same"))
             block.add_module(f"a_{i}", nn.SiLU())
-            block.add_module(f"n_{i}", nn.BatchNorm2d(d_in))
+        block.add_module("norm", LayerNorm(d_in, dim=1))
         return nn.Sequential(block)
 
 class GDecoder(nn.Module):
