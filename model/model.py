@@ -42,22 +42,22 @@ class Generator(nn.Module):
     
 
 def make_model(src_g_len=64, tgt_g_len=64, N=2, 
-               d_model=32, h=8, dropout=0.1):
+               d_model=32, h=4, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
-    ff = PositionwiseFeedForward(d_model, d_model*2, dropout)
+    ff = PositionwiseFeedForward(d_model, d_model//4, dropout)
     model = EncoderDecoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
         Decoder(DecoderLayer(d_model, c(attn), c(attn), 
                              c(ff), dropout), N),
-        nn.Sequential(Embeddings(src_g_len, d_model), c(ff)),
-        nn.Sequential(Embeddings(d_model, tgt_g_len), c(ff)),
+                                            c(ff),
+                                            c(ff),
         Generator(d_model, tgt_g_len))
     
     # This was important from their code. 
     # Initialize parameters with Glorot / fan_avg.
     for p in model.parameters():
         if p.dim() > 1:
-            nn.init.xavier_uniform(p)
+            nn.init.xavier_uniform_(p)
     return model

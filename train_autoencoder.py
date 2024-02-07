@@ -6,7 +6,7 @@ import numpy as np
 from argparse import ArgumentParser
 from torch.autograd import Variable
 from arguments import ModelParams, OptimizationParams, PipelineParams
-from model.autoencoder import GAutoEncoder
+from model.autoencoder import GAutoEncoder, GaussianHandler
 from model.shared import subsequent_mask
 from model.model import make_model, EncoderDecoder
 from scene import GaussianModel, Scene
@@ -19,11 +19,11 @@ import math
 
 from scene.cameras import MiniCam
 
-START_GAUSSIAN = torch.zeros(64,dtype=torch.float32)-10
+START_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
 START_GAUSSIAN[59] = 1
-PAD_GAUSSIAN = torch.zeros(64,dtype=torch.float32)-10
+PAD_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
 PAD_GAUSSIAN[61] = 1
-END_GAUSSIAN = torch.zeros(64,dtype=torch.float32)-10
+END_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
 END_GAUSSIAN[63] = 1
 
 def fuzzy_token_equal(gaussian, token):
@@ -43,6 +43,7 @@ def flattenGaussians(x : GaussianModel):
     
 def unflattenGaussians(x) -> GaussianModel:
     x = torch.squeeze(x)
+    x = x[torch.all(x[:, 59:] <= 0.5, -1)]
     gaussian_model = GaussianModel(3)
     gaussian_model.active_sh_degree = 3
     features =  x[:, :48].reshape((x.shape[0], 16, 3))
@@ -105,9 +106,11 @@ if __name__ == "__main__":
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, -1)
     f_gaussians = flattenGaussians(scene.gaussians).cuda()
+    handler = GaussianHandler(gaussians)
+    iter = handler.box_sort(gaussians)
     background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     torch.autograd.set_detect_anomaly(True)
-    model = GAutoEncoder()
+    model = GAutoEncoder(scene.gaussians)
     model.cuda()
     model.train()
     model_opt = NoamOpt(2048, 8, 2000,
