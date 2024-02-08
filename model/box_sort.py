@@ -54,6 +54,16 @@ class GaussianHandler():
                 last += count
             return sorted
         
+    def denormalize_copy(self, gaussians : GaussianModel):
+        g = GaussianModel(3)
+        g._features_dc = gaussians._features_dc
+        g._features_rest = gaussians._features_rest
+        g._opacity = gaussians._opacity
+        g._rotation = gaussians._rotation
+        g._xyz = gaussians.get_xyz * (self.worldMax - self.worldMin) + self.worldMin
+        g._scaling = gaussians._scaling * (self.scalingMax - self.scalingMin) + self.scalingMin
+        return g
+    
     def denormalize(self, gaussians : GaussianModel):
         gaussians._xyz = gaussians.get_xyz * (self.worldMax - self.worldMin) + self.worldMin
         gaussians._scaling = gaussians._scaling * (self.scalingMax - self.scalingMin) + self.scalingMin

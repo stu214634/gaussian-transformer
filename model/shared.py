@@ -11,19 +11,16 @@ def clones(module, N):
 
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
-    def __init__(self, features, eps=1e-4, dim=-1):
+    def __init__(self, features, eps=1e-5):
         super(LayerNorm, self).__init__()
         self.a_2 = nn.Parameter(torch.ones(features))
         self.b_2 = nn.Parameter(torch.zeros(features))
         self.eps = eps
-        self.dim = dim
 
     def forward(self, x):
-        x = torch.transpose(x, -1, self.dim)
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
-        res = self.a_2 * (x - mean) / (std + self.eps) + self.b_2
-        return torch.transpose(res, -1, self.dim)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
     
 
 class SublayerConnection(nn.Module):

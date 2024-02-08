@@ -1,4 +1,5 @@
 import copy
+import torch
 from torch import nn
 from torch.nn import functional as F
 from .attention import MultiHeadedAttention
@@ -12,18 +13,29 @@ class EncoderDecoder(nn.Module):
     A standard Encoder-Decoder architecture. Base for this and many 
     other models.
     """
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator, worldMax, worldMin, scalingMax, scalingMin, stacking):
         super(EncoderDecoder, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.src_embed = src_embed
         self.tgt_embed = tgt_embed
         self.generator = generator
+        self.min = torch.zeros((64))
+        self.min[53:56] = worldMin
+        self.min[56:59] = scalingMin
+        self.min = torch.unsqueeze(torch.unsqueeze(self.min.repeat(2**stacking),0),0).cuda()
+        self.max = torch.ones((64))
+        self.max[53:56] = worldMax
+        self.max[56:59] = scalingMax
+        self.max = torch.unsqueeze(torch.unsqueeze(self.max.repeat(2**stacking),0),0).cuda()
         
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask,
+        src = (src - self.min) / (self.max - self.min)
+        tgt = (tgt - self.min) / (self.max - self.min)
+        tgt =  self.decode(self.encode(src, src_mask), src_mask,
                             tgt, tgt_mask)
+        return tgt * (self.max - self.min) + self.min
     
     def encode(self, src, src_mask):
         return self.encoder(self.src_embed(src), src_mask)
@@ -41,7 +53,7 @@ class Generator(nn.Module):
         return self.proj(x)
     
 
-def make_model(src_g_len=64, tgt_g_len=64, N=2, 
+def make_model(worldMax, worldMin, scalingMax, scalingMin, stacking, src_g_len=64, tgt_g_len=64, N=2, 
                d_model=32, h=4, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
@@ -53,7 +65,7 @@ def make_model(src_g_len=64, tgt_g_len=64, N=2,
                              c(ff), dropout), N),
                                             c(ff),
                                             c(ff),
-        Generator(d_model, tgt_g_len))
+        Generator(d_model, tgt_g_len), worldMax, worldMin, scalingMax, scalingMin, stacking)
     
     # This was important from their code. 
     # Initialize parameters with Glorot / fan_avg.
