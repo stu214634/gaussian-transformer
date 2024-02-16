@@ -11,27 +11,29 @@ from model.model import make_model, EncoderDecoder
 from scene import GaussianModel, Scene
 from gaussian_renderer import render, network_gui
 from torch.utils.tensorboard import SummaryWriter
+from scene.cameras import MiniCam
 from utils.system_utils import searchForMaxIteration
 import time
 import os
 import lpips
 import math
 import datetime
+import matplotlib.pyplot as plt
 
 from utils.loss_utils import ssim
 
-START_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
-START_GAUSSIAN[59] = 1
-PAD_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
-PAD_GAUSSIAN[61] = 1
-END_GAUSSIAN = torch.zeros(64,dtype=torch.float32)
-END_GAUSSIAN[63] = 1
+START_GAUSSIAN = torch.zeros(26,dtype=torch.float32)
+START_GAUSSIAN[23] = 1
+PAD_GAUSSIAN = torch.zeros(26,dtype=torch.float32)
+PAD_GAUSSIAN[24] = 1
+END_GAUSSIAN = torch.zeros(26,dtype=torch.float32)
+END_GAUSSIAN[25] = 1
 
-STACK = 6
+STACK = 7
 
 def fuzzy_token_equal(gaussian, token):
     return torch.sum(torch.abs(gaussian - token), -1) <= 0.5
-
+    
 def flattenGaussians(x : GaussianModel):
     features = x.get_features
     features = features.reshape((features.shape[0], features.shape[1]*features.shape[2]))
@@ -39,28 +41,30 @@ def flattenGaussians(x : GaussianModel):
     opa = x._opacity
     xyz = x._xyz
     sca = x._scaling
-    flags = torch.zeros((sca.shape[0], 5), device="cuda")
+    flags = torch.zeros((sca.shape[0], 3), device="cuda")
     out = torch.concat((features, rot, opa, xyz, sca, flags), axis=1)
     return out
     
 def unflattenGaussians(x) -> GaussianModel:
-    x = torch.squeeze(x)
-    x = x[torch.all(x[:, 59:] <= 0.5, -1)]
-    gaussian_model = GaussianModel(3)
-    gaussian_model.active_sh_degree = 3
-    features =  x[:, :48].reshape((x.shape[0], 16, 3))
+    gaussian_model = GaussianModel(1)
+    gaussian_model.active_sh_degree = 1
+    flags = ~torch.isclose(x[:, 23:].sum(-1), torch.ones((1), dtype=torch.float32, device="cuda"))
+    x = x[flags]
+    features =  x[:, :12].reshape((x.shape[0], 4, 3))
     gaussian_model._features_dc = features[:, 0:1, :]
     gaussian_model._features_rest = features[:, 1:, :]
-    gaussian_model._rotation = x[:, 48:52]
-    gaussian_model._opacity = x[:, 52:53]
-    gaussian_model._xyz = x[:, 53:56]
-    gaussian_model._scaling = x[:, 56: 59]
+    gaussian_model._rotation = x[:, 12:16]
+    gaussian_model._opacity = x[:, 16:17]
+    gaussian_model._xyz = x[:, 17:20]
+    gaussian_model._scaling = x[:, 20: 23]
     return gaussian_model
+
 class TrainingScene:
-    def __init__(self, args, pipe, batch_size = 1, max_len=600_000) -> None:
+    def __init__(self, args, pipe, batch_size = 1, max_len=1_200_000) -> None:
         with torch.no_grad():
             self.max_len = max_len
-            gaussian_model = GaussianModel(3)
+            self.source_path = args.source_path
+            gaussian_model = GaussianModel(1)
             self.scene = Scene(args, gaussian_model, -1)
             self.handler = GaussianHandler(self.scene.gaussians, 40)
             self.scene.gaussians = self.handler.denormalize(unflattenGaussians(self.handler.box_sort(self.scene.gaussians)))
@@ -73,10 +77,10 @@ class TrainingScene:
             self.prep_cameras()
             self.batch_size = batch_size
             self.size = len(self.cameras) // batch_size
-            self.dropout = 0.01
+            self.dropout = 0.3
 
     def train_iter(self):
-        self.dropout = min(1.20-math.exp(-0.0001*epoch), 0.8)
+        #self.dropout = min(1.20-math.exp(-0.0001*epoch), 0.8)
         self.idxs = self.make_indexes()
         for _ in range(len(self.idxs)):
             with torch.no_grad():
@@ -90,7 +94,7 @@ class TrainingScene:
                     render_pkg = render(self.cameras[idxs[i]], self.scene.gaussians, self.pipe, self.bg)
                     image, visibility_filter = render_pkg["render"], render_pkg["visibility_filter"]
                     seen_gaussians = gaussian_list[visibility_filter]
-                    padding = torch.empty((-seen_gaussians.shape[0]%(64*2**STACK), 64)).cuda()
+                    padding = torch.empty((-seen_gaussians.shape[0]%(26*2**STACK), 26)).cuda()
                     padding[:] = PAD_GAUSSIAN
                     seen_gaussians = torch.cat([seen_gaussians, padding], 0)
                     for _ in range(STACK):
@@ -100,8 +104,8 @@ class TrainingScene:
                     high = int(mid + mid * self.dropout)
                     tgt_count = high - low
                     src_count = seen_gaussians.shape[0] - tgt_count
-                    src_gaussians = torch.zeros((self.batch_size, src_count+2, 64*2**STACK))
-                    tgt_gaussians = torch.zeros((self.batch_size, tgt_count+2, 64*2**STACK))
+                    src_gaussians = torch.zeros((self.batch_size, src_count+1, 26*2**STACK))
+                    tgt_gaussians = torch.zeros((self.batch_size, tgt_count+2, 26*2**STACK))
                     tgt_gaussians[:, 0] = src_gaussians[:, 0] = START_GAUSSIAN.repeat(2**STACK)
                     src_gaussians[i, 1:(src_count+1)] = torch.cat([seen_gaussians[:low], seen_gaussians[high:]])
                     tgt_gaussians[i, 1:(tgt_count+1)] = seen_gaussians[low:high]
@@ -200,48 +204,83 @@ class ImageLossCompute:
         self.bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
         self.opt = opt
         
-    def __call__(self, prompt, x, y, tgt, camera):
+    def __call__(self, prompt, x, y, tgt, camera : MiniCam):
         global global_step
         x = torch.squeeze(self.generator(x))
-        x = torch.clamp(x, prompt.min()-10, prompt.max()+10)
-        gaussian_model = stackToGaussians(torch.cat([prompt, x],  0))
-        render_pkg = render(camera, gaussian_model, self.pipe, self.bg)
-        image = render_pkg["render"]
-        image = (image - image.min()) / (image.max() - image.min() + 1e-9)
-        original_image = camera.original_image.cuda()
-        gen = self.criterion(image, original_image)
-        perceptive = self.loss_perceptive(torch.unsqueeze((image*2)-1,0), torch.unsqueeze((original_image*2)-1,0))
-        #ssim_l = ssim(image, original_image)
-        loss = gen*0.5
-        loss += 0.4*torch.squeeze(perceptive)
-        l2 = torch.nn.functional.mse_loss(x , torch.squeeze(tgt))
-        loss += 0.2*l2
+        gaussian_model_pred = stackToGaussians(x)
+        gaussian_model_tgt = stackToGaussians(torch.squeeze(tgt))
+        gaussian_model_y = stackToGaussians(torch.cat([prompt, torch.squeeze(tgt)], 0))
+        gaussian_model = stackToGaussians(torch.cat([prompt, x]))
+        
+        scalings_mean_tgt = gaussian_model_y.get_scaling.mean(dim=0)
+        scalings_std_tgt = gaussian_model_y.get_scaling.std(dim=0)
+        scalings_mean_pred = gaussian_model.get_scaling.mean(dim=0)
+        scalings_std_pred = gaussian_model.get_scaling.std(dim=0)
+        scalingsloss_mean = ((scalings_mean_pred - scalings_mean_tgt)**2).mean()
+        scalingsloss_std = ((scalings_std_pred - scalings_std_tgt)**2).mean()
+        
+        tgt_cam_dist = ((gaussian_model_tgt.get_xyz - camera.camera_center)**2).sum(-1)
+        pred_cam_dist = ((gaussian_model_pred.get_xyz - camera.camera_center)**2).sum(-1)
+
+        camdist_mean = torch.abs(tgt_cam_dist.mean() - pred_cam_dist.mean())
+        camdist_std = torch.abs(tgt_cam_dist.std() - pred_cam_dist.std())
+        
+        loss = scalingsloss_mean + scalingsloss_std
+        loss += camdist_mean*0.5 + camdist_std 
+        
+        writer.add_scalar("scalingsmean_loss", scalingsloss_mean.data.item(), global_step)
+        writer.add_scalar("scalingsstd_loss", scalingsloss_std.data.item(), global_step)
+
+        writer.add_scalar("camdistmean_loss", camdist_mean.data.item(), global_step)
+        writer.add_scalar("camdiststd_loss", camdist_std.data.item(), global_step)
+        if global_step < 150:
+            
+            xyz_mean_y = gaussian_model_tgt.get_xyz.mean(dim=0)
+            xyz_std_y = gaussian_model_tgt.get_xyz.std(dim=0)
+            xyz_mean_pred = gaussian_model_pred.get_xyz.mean(dim=0)
+            xyz_std_pred = gaussian_model_pred.get_xyz.std(dim=0)
+            xyzloss_mean = ((xyz_mean_pred - xyz_mean_y)**2).mean()
+            xyzloss_std = ((xyz_std_pred - xyz_std_y)**2).mean()
+            
+            loss += xyzloss_mean + xyzloss_std
+            writer.add_scalar("xyzmean_loss", xyzloss_mean.data.item(), global_step)
+            writer.add_scalar("xyzstd_loss", xyzloss_std.data.item(), global_step)
+        else:
+            render_pkg = render(camera, gaussian_model, self.pipe, self.bg)
+            image = render_pkg["render"]
+            image = (image - image.min()) / (image.max() - image.min() + 1e-9)
+            original_image = camera.original_image.cuda()
+            gen = self.criterion(image, original_image)
+            perceptive = self.loss_perceptive(torch.unsqueeze((image*2)-1,0), torch.unsqueeze((original_image*2)-1,0))
+            ssim_l = 1 - ssim(image, original_image)
+            loss += gen*0.5
+            loss += 0.2*torch.squeeze(perceptive)
+            loss += 0.2*ssim_l
+            writer.add_scalar("perceptive_loss", perceptive.data.item(), global_step)
+            writer.add_scalar("gen_loss", gen.data.item(), global_step)
+            writer.add_scalar("ssim_loss", ssim_l.data.item(), global_step)
+            if (global_step % 5 == 0):
+                with torch.no_grad():
+                    gaussian_model_prompt = stackToGaussians(prompt)
+                    render_pkg_prompt = render(camera, gaussian_model_prompt, self.pipe, self.bg)
+                    image_prompt = render_pkg_prompt["render"]
+                    render_pkg_sanity = render(camera, gaussian_model_y, self.pipe, self.bg)
+                    image_sanity = render_pkg_sanity["render"]
+                    writer.add_image("prompt", image_prompt, global_step)
+                    writer.add_image("prompt + x", image, global_step)
+                    writer.add_image("base", torch.squeeze(y), global_step)
+                    writer.add_image("sanity", image_sanity, global_step)
+                    writer.add_image("target", original_image, global_step)
+                    writer.add_image("diff", torch.abs(image_prompt - image), global_step)
+
+
         loss.backward()
-        if self.opt is not None:
-            self.opt.step()
-            self.opt.optimizer.zero_grad()
-        writer.add_scalar("l2_loss", l2.data.item(), global_step)
+        self.opt.step()
+        self.opt.optimizer.zero_grad()
         writer.add_scalar("loss", loss.data.item(), global_step)
-        writer.add_scalar("perceptive_loss", perceptive.data.item(), global_step)
-        writer.add_scalar("gen_loss", gen.data.item(), global_step)
-        #writer.add_scalar("ssim_loss", ssim_l.data.item(), global_step)
         writer.add_scalar("lr", self.opt.rate(), global_step)
-        global_step += 1
-        if (global_step % 5 == 0):
-            with torch.no_grad():
-                gaussian_model_prompt = stackToGaussians(prompt)
-                render_pkg_prompt = render(camera, gaussian_model_prompt, self.pipe, self.bg)
-                image_prompt = render_pkg_prompt["render"]
-                gaussian_model_sanity = stackToGaussians(torch.cat([prompt, torch.squeeze(tgt)], 0))
-                render_pkg_sanity = render(camera, gaussian_model_sanity, self.pipe, self.bg)
-                image_sanity = render_pkg_sanity["render"]
-            writer.add_image("prompt", image_prompt, global_step)
-            writer.add_image("prompt + x", image, global_step)
-            writer.add_image("base", torch.squeeze(y), global_step)
-            writer.add_image("sanity", image_sanity, global_step)
-            writer.add_image("target", original_image, global_step)
-            writer.add_image("diff", torch.abs(image_prompt - image), global_step)
         writer.flush()
+        global_step += 1
         return loss.data.item()
     
         
@@ -258,6 +297,24 @@ def run_epoch(data_iter, model : EncoderDecoder, loss_compute, iter_size):
         batch = batch
         out = model.forward(batch["src"], batch["trg"], 
                             batch["src_mask"], batch["trg_mask"])
+        
+        if network_gui.conn == None:
+            network_gui.try_connect()
+        while network_gui.conn != None:
+            try:
+                net_image_bytes = None
+                custom_cam, do_training, tScene.pipe.convert_SHs_python, tScene.pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                if custom_cam != None:
+                    gOut = model.generator(out)
+                    net_image = render(custom_cam, stackToGaussians(torch.cat([torch.squeeze(batch["src"]), torch.squeeze(gOut)], 0)), tScene.pipe, tScene.bg, scaling_modifer)["render"]
+                    #net_image = render(custom_cam, stackToGaussians(torch.squeeze(batch["src"])), tScene.pipe, tScene.bg, scaling_modifer)["render"]
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, tScene.source_path)
+                if not do_training:
+                    break
+            except Exception as e:
+                print(e)
+                network_gui.conn = None
         image = batch["trg_im"]
         loss = loss_compute(torch.squeeze(batch["src"]), out, image, batch["trg_y"], batch["cam"][0])
         total_loss += loss
@@ -293,34 +350,31 @@ if __name__ == "__main__":
     torch.autograd.anomaly_mode.set_detect_anomaly(True)
 
  
-    V = 64*2**STACK
-    model = make_model(tScene.handler.worldMax,
-                       tScene.handler.worldMin,
-                       tScene.handler.scalingMax,
-                       tScene.handler.scalingMin,
-                       STACK,
-                       V, V, N=2, d_model=64*2**STACK,)
+    V = 26*2**STACK
+    model = make_model(STACK, V, V, N=3, d_model=26*2**STACK,)
     model.cuda()
-    model_opt = NoamOpt(64*2**STACK, 0.01, 2000,
-            torch.optim.Adamax(model.parameters(), lr=0, betas=(0.9, 0.98)))
+    model_opt = NoamOpt(26, 0.005, 200,
+            torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-15))
 
     
     
-    run_name = datetime.datetime.fromtimestamp(time.time()).strftime('%a_%d_%b_%I_%M%p')
+    run_name = "runs/" + datetime.datetime.fromtimestamp(time.time()).strftime('%a_%d_%b_%I_%M%p')
+    run_name = "runs/Thu_15_Feb_05_04PM"
     if not os.path.exists(run_name): 
         os.mkdir(run_name)
     else:
         max_iter = searchForMaxIteration(run_name)
+        print(f"loading Model iter {max_iter}")
         model.load_state_dict(torch.load(f"{run_name}/checkpoint_{max_iter}/model.pt"))
     
-    writer = SummaryWriter(f'{run_name}/log')
+    writer = SummaryWriter(f'{run_name}/log/cont/')
 
     global_step = 0
     model_opt._step = global_step
     model.train()
     lowest_loss = 1e9
     loss_func = ImageLossCompute(model.generator, pp.extract(args), model_opt)
-    for epoch in range(0, 20000, 1):
+    for epoch in range(101, 20000, 1):
         try:
             loss = run_epoch(tScene.train_iter(), model, loss_func, tScene.size)
             print(f"Epoch: {epoch} Loss: {loss}")

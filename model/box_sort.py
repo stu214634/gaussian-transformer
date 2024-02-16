@@ -10,9 +10,21 @@ def flattenGaussians(x : GaussianModel):
     opa = x._opacity
     xyz = x._xyz
     sca = x._scaling
-    flags = torch.zeros((sca.shape[0], 5), device="cuda")
+    flags = torch.zeros((sca.shape[0], 3), device="cuda")
     out = torch.concat((features, rot, opa, xyz, sca, flags), axis=1)
     return out
+    
+def unflattenGaussians(x) -> GaussianModel:
+    gaussian_model = GaussianModel(1)
+    gaussian_model.active_sh_degree = 1
+    features =  x[:, :12].reshape((x.shape[0], 4, 3))
+    gaussian_model._features_dc = features[:, 0:1, :]
+    gaussian_model._features_rest = features[:, 1:, :]
+    gaussian_model._rotation = x[:, 12:16]
+    gaussian_model._opacity = x[:, 16:17]
+    gaussian_model._xyz = x[:, 17:20]
+    gaussian_model._scaling = x[:, 20: 23]
+    return gaussian_model
 
 
 class GaussianHandler():
@@ -44,8 +56,8 @@ class GaussianHandler():
                 x = i % self.interval_num
                 y = (i // self.interval_num) % self.interval_num
                 z = i // self.interval_num**2
-                mask = torch.all(torch.cat([gaussians[:, 53:56] >= torch.FloatTensor([interval_size*x, interval_size*y, interval_size*z]).cuda(),
-                                gaussians[:, 53:56] < torch.FloatTensor([interval_size*(x+1), interval_size*(y+1), interval_size*(z+1)]).cuda()], -1), -1)
+                mask = torch.all(torch.cat([gaussians[:, 17:20] >= torch.FloatTensor([interval_size*x, interval_size*y, interval_size*z]).cuda(),
+                                gaussians[:, 17:20] < torch.FloatTensor([interval_size*(x+1), interval_size*(y+1), interval_size*(z+1)]).cuda()], -1), -1)
                 box_gaussians = gaussians[mask]
                 count = box_gaussians.shape[0]
                 if count == 0:

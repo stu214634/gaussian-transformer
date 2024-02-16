@@ -12,6 +12,56 @@ class GAutoEncoder(nn.Module):
         super().__init__()
     
 
+class GAutoEncoder(nn.Module):
+    def __init__(self, factor = 1) -> None:
+        super(GAutoEncoder, self).__init__()
+        #self.encoder = GEncoder(factor)
+        #self.decoder = GDecoder(factor)
+        self.w = nn.parameter.Parameter(torch.Tensor([0.1]))
+    def forward(self, x):
+        return self.w * x
+        return self.decoder(self.encoder(x))
+
+
+
+class GEncoder(nn.Sequential):
+    def __init__(self, factor) -> None:
+        super(GEncoder, self).__init__()
+        self.append(nn.Conv1d(26, 32, 1))
+        self.append(nn.Conv1d(32, 32, 1, 1))
+        for _ in range(3):
+            self.append(nn.Conv1d(32, 32, 1, 1))
+
+        for i in range(0, factor-1, 1):
+            inD = 2**(i-1)*32
+            outD = 2**i*32
+            self.append(nn.Conv1d(inD, outD, 5, 2, 2))
+            self.append(nn.SiLU())
+            for _ in range(3):
+                self.append(nn.Conv1d(outD, outD, 3, 1, 1))
+                self.append(nn.SiLU())
+    
+class GaussianUnshuffle1D(nn.Module):
+    def __init__(self) -> None:
+        super(GaussianUnshuffle1D, self).__init__()
+  
+    def forward(self, x):
+        return torch.reshape(x, (x.shape[0], x.shape[1]//2, x.shape[2]*2))
+                
+class GDecoder(nn.Sequential):
+    def __init__(self, factor) -> None:
+        super(GDecoder, self).__init__()
+
+        for i in range(factor-1, 0, -1):
+            inD = 2**(i+1)*64
+            outD = 2**i*64
+            self.append(GaussianUnshuffle1D())
+            self.append(nn.SiLU())
+            for _ in range(3):
+                self.append(nn.Conv1d(outD, outD, 3, 1, 1))
+        self.append(nn.Conv1d(32, 26, 1))
+
+
 
 
 # class GAutoEncoder(nn.Module):
@@ -91,12 +141,7 @@ class GAutoEncoder(nn.Module):
 #         residuals.append(nn.functional.softmax(features, 1))
 #         return self.reduce(features), residuals[::-1]
 
-# class GaussianUnshuffle1D(nn.Module):
-#     def __init__(self) -> None:
-#         super(GaussianUnshuffle1D, self).__init__()
-    
-#     def forward(self, x):
-#         return torch.reshape(x, (x.shape[0], x.shape[1]//2, x.shape[2]*2))
+
     
 # class GaussianUnshuffle2D(nn.Module):
 #     def __init__(self) -> None:
