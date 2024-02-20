@@ -20,19 +20,9 @@ class EncoderDecoder(nn.Module):
         self.src_embed = src_embed
         self.tgt_embed = tgt_embed
         self.generator = generator
-        #self.min = torch.zeros((64))
-        #self.min[53:56] = worldMin
-        #self.min[56:59] = scalingMin
-        #self.min = torch.unsqueeze(torch.unsqueeze(self.min.repeat(2**stacking),0),0).cuda()
-        #self.max = torch.ones((64))
-        #self.max[53:56] = worldMax
-        #self.max[56:59] = scalingMax
-        #self.max = torch.unsqueeze(torch.unsqueeze(self.max.repeat(2**stacking),0),0).cuda()
         
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
-        #src = (src - self.min) / (self.max - self.min)
-        #tgt = (tgt - self.min) / (self.max - self.min)
         tgt =  self.decode(self.encode(src, src_mask), src_mask,
                             tgt, tgt_mask)
         return tgt

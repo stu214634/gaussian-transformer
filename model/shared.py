@@ -2,6 +2,7 @@ import copy
 import math
 import torch
 import numpy as np
+import torch_activation as act
 from torch import nn
 from torch.nn import functional as F
 
@@ -42,11 +43,12 @@ class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super(PositionwiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(d_model, d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
+        self.w_2 = nn.Linear(d_model, d_model)
+        self.activation = act.glus.SwiGLU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+        return self.w_2(self.dropout(self.activation(self.w_1(x))))
     
 class Interleave(nn.Module):
     def __init__(self) -> None:

@@ -19,7 +19,9 @@ import lpips
 import math
 import datetime
 import matplotlib.pyplot as plt
+import torch_optimizer as optim
 from chamfer_distance import ChamferDistance as chamfer_dist
+
 
 from utils.loss_utils import ssim
 
@@ -107,12 +109,10 @@ class TrainingScene:
                 src_gaussians[0] = torch.cat([seen_gaussians[:low], seen_gaussians[high:]])
                 tgt_gaussians[0] = seen_gaussians[low:high]
 
-            src_mask = (False == fuzzy_token_equal(src_gaussians.unsqueeze(-3), PAD_GAUSSIAN.repeat(2**STACK)))
+            src_mask = None
+            tgt_mask = None
             tgt_gaussians_y = tgt_gaussians
             tgt_gaussians = tgt_gaussians
-            tgt_mask = self.make_std_mask(tgt_gaussians)
-            src_mask = src_mask.cuda()
-            tgt_mask = tgt_mask.cuda()
             src_gaussians = src_gaussians.cuda()
             tgt_gaussians = tgt_gaussians.cuda()
             tgt_gaussians_y = tgt_gaussians_y.cuda()
@@ -195,7 +195,7 @@ class ImageLossCompute:
         #Start with Chamfer-Dist
         chamfer = ((torch.mean(dist1)) + (torch.mean(dist2))) / tScene.batch_size
 
-        #Check if Gaussians are reasonably reasonably behaved to protect the renderer from running OOM
+        #Check if Gaussians are reasonably behaved to protect the renderer from running OOM
         if chamfer < 3:
             prompt_list = unstack(prompt)
             gaussians = unflattenGaussians(torch.cat([prompt_list, pred_list], 0))
@@ -239,9 +239,10 @@ class ImageLossCompute:
 
         loss.backward()
         self.opt.step()
-        self.opt.optimizer.zero_grad()
+        self.opt.zero_grad()
+        scheduler.step()
 
-        writer.add_scalar("lr", self.opt.rate(), global_step)
+        #writer.add_scalar("lr", self.opt.rate(), global_step)
         writer.flush()
         global_step += 1
         return loss.data.item()
@@ -317,13 +318,11 @@ if __name__ == "__main__":
     V = 26*2**STACK
     model = make_model(STACK, V, V, N=3, d_model=26*2**STACK,)
     model.cuda()
-    model_opt = NoamOpt(V, 0.005, 20,
-            torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-15))
-
-    
+    optimizer = optim.Adafactor(model.parameters(), 0.0005)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
     
     run_name = "runs/" + datetime.datetime.fromtimestamp(time.time()).strftime('%a_%d_%b_%I_%M%p')
-    run_name = "runs/Sun_18_Feb_05_12PM"
+    #run_name = "runs/Sun_18_Feb_05_12PM"
     if not os.path.exists(run_name): 
         os.mkdir(run_name)
         max_iter = -1
@@ -331,24 +330,22 @@ if __name__ == "__main__":
         max_iter = searchForMaxIteration(run_name)
         print(f"loading Model iter {max_iter}")
         model.load_state_dict(torch.load(f"{run_name}/checkpoint_{max_iter}/model.pt"))
-        model_opt.optimizer.load_state_dict(torch.load(f"{run_name}/checkpoint_{max_iter}/optim.pt"))
+        optimizer.load_state_dict(torch.load(f"{run_name}/checkpoint_{max_iter}/optim.pt"))
     
     writer = SummaryWriter(f'logs/{run_name}/base/')
 
-    global_step = 190
-    model_opt._step = global_step
+    global_step = 0
     model.train()
     lowest_loss = 1e9
-    loss_func = ImageLossCompute(model.generator, pp.extract(args), model_opt)
+    loss_func = ImageLossCompute(model.generator, pp.extract(args), optimizer)
     for epoch in range(max_iter + 1, 20000, 1):
         loss = run_epoch(tScene.train_iter(), model, loss_func, tScene.size)
         print(f"Epoch: {epoch} Loss: {loss}")
-        model_opt.optimizer.zero_grad()
         if epoch % 20 == 0:
             dir = f"{run_name}/checkpoint_{epoch}"
             os.mkdir(dir)
             torch.save(model.state_dict(), f"{dir}/model.pt")
-            torch.save(model_opt.optimizer.state_dict(), f"{dir}/optim.pt")
+            torch.save(optimizer.state_dict(), f"{dir}/optim.pt")
         
     # All done
     print("\nTraining complete.")
