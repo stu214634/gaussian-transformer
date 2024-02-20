@@ -182,44 +182,36 @@ class ImageLossCompute:
         self.bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
         self.opt = opt
         self.chd = chamfer_dist()
-        self.criterion = torch.nn.L1Loss()
-        self.loss_perceptive = lpips.LPIPS(net='alex').cuda()
+        self.criterion = torch.nn.MSELoss()
+        #self.loss_perceptive = lpips.LPIPS(net='alex').cuda()
         
     def __call__(self, prompt, x, tgt_im, tgt, cameras):
         global global_step
         x = self.generator(x)
         pred_list = unstack(x)
         tgt_list = unstack(tgt)
-        dist1, dist2, idx1, idx2 = self.chd(torch.unsqueeze(pred_list, 0),torch.unsqueeze(tgt_list, 0))
+        dist1, dist2, idx1, idx2 = self.chd(torch.unsqueeze(pred_list[17:20], 0),torch.unsqueeze(tgt_list[17:20], 0))
 
         #Start with Chamfer-Dist
-        chamfer = ((torch.mean(dist1)) + (torch.mean(dist2))) / tScene.batch_size
+        chamfer = ((torch.mean(dist1)) + (torch.mean(dist2)))
 
         #Check if Gaussians are reasonably reasonably behaved to protect the renderer from running OOM
-        if chamfer < 3:
-            prompt_list = unstack(prompt)
-            gaussians = unflattenGaussians(torch.cat([prompt_list, pred_list], 0))
-            images = torch.empty_like(tgt_im)
-            #Render the prediction from all camera angles in batch
-            for i, cam in enumerate(cameras):
-                render_pkg = render(cam, gaussians, self.pipe, self.bg)
-                image = render_pkg["render"]
-                images[i] = torch.clamp(image, 0, 1)
-            
-            #Calcuate Image losses
-            gen = self.criterion(images, tgt_im)
-            perceptive = self.loss_perceptive(images*2-1, tgt_im*2-1).mean()
-            ssim_l = 1 - ssim(images, tgt_im)
-            gen *= 5.0/(i+1)
-            perceptive *= 1.0/(i+1)
-            ssim_l *= 0.2/(i+1)
+        if chamfer < 0.1:
 
-            loss = gen + perceptive + ssim_l + chamfer
-            writer.add_scalar("perceptive_loss", perceptive.data.item(), global_step)
-            writer.add_scalar("gen_loss", gen.data.item(), global_step)
-            writer.add_scalar("ssim_loss", ssim_l.data.item(), global_step)
+            l2 = self.criterion(torch.unsqueeze(pred_list, 0), torch.unsqueeze(tgt_list[idx1], 0))
+            loss = l2 + chamfer
+            writer.add_scalar("l2", l2.data.item(), global_step)
+
             if (global_step % 5 == 0):
                 with torch.no_grad():
+                    prompt_list = unstack(prompt)
+                    gaussians = unflattenGaussians(torch.cat([prompt_list, pred_list], 0))
+                    images = torch.empty_like(tgt_im)
+                    #Render the prediction from all camera angles in batch
+                    for i, cam in enumerate(cameras):
+                        render_pkg = render(cam, gaussians, self.pipe, self.bg)
+                        image = render_pkg["render"]
+                        images[i] = torch.clamp(image, 0, 1)
                     gaussian_model_prompt = unflattenGaussians(prompt_list)
                     prompts = torch.empty_like(tgt_im)
                     for i, cam in enumerate(cameras):
@@ -315,15 +307,15 @@ if __name__ == "__main__":
 
  
     V = 26*2**STACK
-    model = make_model(STACK, V, V, N=3, d_model=26*2**STACK,)
+    model = make_model(STACK, V, V, N=1, d_model=26*2**STACK,)
     model.cuda()
     model_opt = NoamOpt(V, 0.005, 20,
-            torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-15))
+            torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-4))
 
     
     
     run_name = "runs/" + datetime.datetime.fromtimestamp(time.time()).strftime('%a_%d_%b_%I_%M%p')
-    run_name = "runs/Sun_18_Feb_05_12PM"
+    #run_name = "runs/Sun_18_Feb_05_12PM"
     if not os.path.exists(run_name): 
         os.mkdir(run_name)
         max_iter = -1
@@ -335,7 +327,7 @@ if __name__ == "__main__":
     
     writer = SummaryWriter(f'logs/{run_name}/base/')
 
-    global_step = 190
+    global_step = 0
     model_opt._step = global_step
     model.train()
     lowest_loss = 1e9
