@@ -1,17 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from knn_cuda import KNN
 from chamfer_distance import chamfer_distance as chd
 from timm.models.layers import DropPath, trunc_normal_
 
 from Pointnet2_PyTorch.pointnet2_ops_lib.pointnet2_ops import pointnet2_utils
 from .misc import fps
 
-
-knn = KNN(k=4, transpose_mode=False)
-
 chamfer_dist = chd.ChamferDistance()
+
 def chamferL1(x, y):
     dist1, dist2, _, _ = chamfer_dist(x, y)
     dist1, dist2 = torch.sqrt(dist1), torch.sqrt(dist2)
@@ -59,13 +56,15 @@ class DGCNN(nn.Module):
 
         # coor: bs, 3, np, x: bs, c, np
 
-        k = 4
+        k = 16
         batch_size = x_k.size(0)
         num_points_k = x_k.size(2)
         num_points_q = x_q.size(2)
 
         with torch.no_grad():
-            _, idx = knn(coor_k, coor_q)  # bs k np
+            coor_k = coor_k.transpose(1, 2).contiguous()
+            coor_q = coor_q.transpose(1, 2).contiguous()
+            idx = knn_point(k, coor_k, coor_q).transpose(1, 2).contiguous()  # bs k np
             assert idx.shape[1] == k
             idx_base = torch.arange(0, batch_size, device=x_q.device).view(-1, 1, 1) * num_points_k
             idx = idx + idx_base
@@ -170,7 +169,7 @@ class Group(nn.Module):
         self.num_group = num_group
         self.group_size = group_size
 
-    def forward(self, xyz):
+    def forward(self, xyz, emb, normalize = True):
         '''
             input: B N 3
             ---------------------------
@@ -192,27 +191,30 @@ class Group(nn.Module):
         idx = idx.view(-1)
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
+        emb = emb.view(batch_size * num_points, -1)[idx, :]
+        emb = emb.view(batch_size, self.num_group, self.group_size, 128).contiguous()
         # normalize
-        neighborhood = neighborhood - center.unsqueeze(2)
-        return neighborhood, center
+        if normalize:
+            neighborhood = neighborhood - center.unsqueeze(2)
+        return neighborhood, center, emb
 
 class Encoder(nn.Module):
     def __init__(self, encoder_channel):
         super().__init__()
         self.encoder_channel = encoder_channel
-        self.first_conv = nn.Sequential(
+        self.first_conv_f = nn.Sequential(
             nn.Conv1d(3, 128, 1),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
-            nn.Conv1d(128, 256, 1)
         )
+        self.first_conv_s = nn.Conv1d(128, 256, 1)
         self.second_conv = nn.Sequential(
             nn.Conv1d(512, 512, 1),
             nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Conv1d(512, self.encoder_channel, 1)
         )
-    def forward(self, point_groups):
+    def forward(self, point_groups, emb_groups):
         '''
             point_groups : B G N 3
             -----------------
@@ -220,8 +222,11 @@ class Encoder(nn.Module):
         '''
         bs, g, n , _ = point_groups.shape
         point_groups = point_groups.reshape(bs * g, n, 3)
+        emb_groups = emb_groups.reshape(bs*g, n, 128).transpose(2, 1)
         # encoder
-        feature = self.first_conv(point_groups.transpose(2,1))  # BG 256 n
+        feature = self.first_conv_f(point_groups.transpose(2,1))  # BG 256 n
+        feature_we = feature + emb_groups
+        feature = self.first_conv_s(feature_we)
         feature_global = torch.max(feature,dim=2,keepdim=True)[0]  # BG 256 1
         feature = torch.cat([feature_global.expand(-1,-1,n), feature], dim=1)# BG 512 n
         feature = self.second_conv(feature) # BG 1024 n
@@ -250,8 +255,9 @@ class Decoder(nn.Module):
             nn.Conv1d(512, 512, 1),
             nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
-            nn.Conv1d(512, 3, 1)
         )
+        self.xyz_head = nn.Conv1d(512, 3, 1)
+        self.emb_head = nn.Conv1d(512, 128, 1)
         a = torch.linspace(-0.05, 0.05, steps=self.grid_size, dtype=torch.float).view(1, self.grid_size).expand(self.grid_size, self.grid_size).reshape(1, -1)
         b = torch.linspace(-0.05, 0.05, steps=self.grid_size, dtype=torch.float).view(self.grid_size, 1).expand(self.grid_size, self.grid_size).reshape(1, -1)
         self.folding_seed = torch.cat([a, b], dim=0).view(1, 2, self.grid_size ** 2) # 1 2 S
@@ -282,10 +288,13 @@ class Decoder(nn.Module):
         center = coarse.unsqueeze(2).expand(-1, -1, self.grid_size**2, -1) # BG (M) S 3
         center = center.reshape(bs * g, self.num_fine, 3).transpose(2, 1) # BG 3 N
 
-        fine = self.final_conv(feat) + center   # BG 3 N
+        out = self.final_conv(feat)
+        fine = self.xyz_head(out) + center   # BG 3 N
         fine = fine.reshape(bs, g, 3, self.num_fine).transpose(-1, -2)
+        fine_emb = self.emb_head(out)
+        fine_emb = fine_emb.reshape(bs, g, 128, self.num_fine).transpose(-1, -2)
         coarse = coarse.reshape(bs, g, self.num_coarse, 3)
-        return coarse, fine
+        return coarse, fine, fine_emb
 
 class DVAEConfig():
     def __init__(self, group_size = 512, num_group = 4096, encoder_dims = 256, num_tokens=8192, tokens_dims=256, decoder_dims=256) -> None:
@@ -323,8 +332,8 @@ class DiscreteVAE(nn.Module):
         self.loss_func_cdl1 = chamferL1
         self.loss_func_cdl2 = chamferL2
 
-    def recon_loss(self, ret, gt):
-        whole_coarse, whole_fine, coarse, fine, group_gt, _ = ret
+    def recon_loss(self, ret):
+        _, _, coarse, fine, _, _, group_gt, _ = ret
 
         bs, g, _, _ = coarse.shape
 
@@ -338,36 +347,48 @@ class DiscreteVAE(nn.Module):
         loss_recon = loss_coarse_block + loss_fine_block
 
         return loss_recon
+    
+    def emb_loss(self, ret):
+        _, _, _, _, fine_emb, n_emb, _, _ = ret
+        return torch.nn.functional.mse_loss(fine_emb, n_emb)
 
-    def get_loss(self, ret, gt):
+    def get_loss(self, ret):
 
         # reconstruction loss
-        loss_recon = self.recon_loss(ret, gt)
+        loss_recon = self.recon_loss(ret)
+        loss_emb = self.emb_loss(ret)
         # kl divergence
         logits = ret[-1] # B G N
         softmax = F.softmax(logits, dim=-1)
         mean_softmax = softmax.mean(dim=1)
         log_qy = torch.log(mean_softmax)
-        log_uniform = torch.log(torch.tensor([1. / self.num_tokens], device = gt.device))
+        log_uniform = torch.log(torch.tensor([1. / self.num_tokens], device = "cuda"))
         loss_klv = F.kl_div(log_qy, log_uniform.expand(log_qy.size(0), log_qy.size(1)), None, None, 'batchmean', log_target = True)
 
-        return loss_recon, loss_klv
+        return loss_recon, loss_klv, loss_emb
 
+    def encode(self, neighborhood, center, n_emb):
+        
+        logits = self.encoder(neighborhood, n_emb)   #  B G C
+        logits = self.dgcnn_1(logits, center)
+        return logits, center, neighborhood, n_emb
 
-    def forward(self, inp, temperature = 1., hard = False, **kwargs):
-        neighborhood, center = self.group_divider(inp)
-        logits = self.encoder(neighborhood)   #  B G C
-        logits = self.dgcnn_1(logits, center) #  B G N
+    def decode(self, tokens, center):
+        feature = self.dgcnn_2(tokens, center)
+        coarse, fine, fine_emb = self.decoder(feature)
+        return coarse, fine, fine_emb
+
+    def forward(self, neighborhood, center, emb, temperature = 1., hard = False, **kwargs):
+        #  B G N
+        logits, center, neighborhood, n_emb = self.encode(neighborhood, center, emb)
         soft_one_hot = F.gumbel_softmax(logits, tau = temperature, dim = 2, hard = hard) # B G N
         sampled = torch.einsum('b g n, n c -> b g c', soft_one_hot, self.codebook) # B G C
-        feature = self.dgcnn_2(sampled, center)
-        coarse, fine = self.decoder(feature)
-
+        coarse, fine, fine_emb = self.decode(sampled, center)
 
         with torch.no_grad():
-            whole_fine = (fine + center.unsqueeze(2)).reshape(inp.size(0), -1, 3)
-            whole_coarse = (coarse + center.unsqueeze(2)).reshape(inp.size(0), -1, 3)
+            whole_fine = (fine + center.unsqueeze(2)).reshape(1, -1, 3)
+            whole_coarse = (coarse + center.unsqueeze(2)).reshape(1, -1, 3)
 
         assert fine.size(2) == self.group_size
-        ret = (whole_coarse, whole_fine, coarse, fine, neighborhood, logits)
+        ret = (whole_coarse, whole_fine, coarse, fine, fine_emb, n_emb, neighborhood, logits)
         return ret

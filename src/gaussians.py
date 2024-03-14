@@ -39,6 +39,44 @@ class GaussianModel():
             l.append('rot_{}'.format(i))
         return l
 
+    def get_idx(self, idxs):
+        with torch.no_grad():
+            take = GaussianModel(self.xyz[idxs], self.opacity[idxs], self.rotation[idxs], self.scaling[idxs], self.shs[idxs])
+            return take
+    
+    def box_sort(self, interval_num = 10):
+        with torch.no_grad():
+            self.interval_num = interval_num
+            self.box_num = self.interval_num**3
+            coords = self.xyz
+            self.worldMin, self.worldMax = coords.min(0)[0], coords.max(0)[0]
+
+            self.xyz = (self.xyz - self.worldMin + 1e-6) / (self.worldMax - self.worldMin + 1e-3) 
+            
+            idxs = torch.empty(self.xyz.shape[0], dtype=torch.long).cuda()
+            interval_size = 1.0/self.interval_num
+            last = 0
+            for i in range(self.box_num):
+                x = i % self.interval_num
+                y = (i // self.interval_num) % self.interval_num
+                z = i // self.interval_num**2
+                mask = torch.all(torch.cat([self.xyz >= torch.FloatTensor([interval_size*x, interval_size*y, interval_size*z]).cuda(),
+                                self.xyz < torch.FloatTensor([interval_size*(x+1), interval_size*(y+1), interval_size*(z+1)]).cuda()], -1), -1)
+                indexes = mask.nonzero().squeeze()
+                if len(indexes.shape) == 0 or indexes.shape[0] == 0:
+                    continue
+                count = indexes.shape[0]
+                idxs[last:last+count] = indexes
+                last += count
+
+            self.xyz = self.xyz[idxs, :]
+            self.opacity = self.opacity[idxs, :]
+            self.rotation = self.rotation[idxs, :]
+            self.scaling = self.scaling[idxs, :]
+            self.shs = self.shs[idxs, :]
+
+            self.xyz = (self.xyz) * (self.worldMax - self.worldMin) + self.worldMin
+
     def save_ply(self, path):
         os.mkdir(os.path.dirname(path))
 
