@@ -8,6 +8,7 @@ from Pointnet2_PyTorch.pointnet2_ops_lib.pointnet2_ops import pointnet2_utils
 from .misc import fps
 
 chamfer_dist = chd.ChamferDistance()
+emb_dim = 128
 
 def chamferL1(x, y):
     dist1, dist2, _, _ = chamfer_dist(x, y)
@@ -56,7 +57,7 @@ class DGCNN(nn.Module):
 
         # coor: bs, 3, np, x: bs, c, np
 
-        k = 16
+        k = 64
         batch_size = x_k.size(0)
         num_points_k = x_k.size(2)
         num_points_q = x_q.size(2)
@@ -192,7 +193,7 @@ class Group(nn.Module):
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
         emb = emb.view(batch_size * num_points, -1)[idx, :]
-        emb = emb.view(batch_size, self.num_group, self.group_size, 128).contiguous()
+        emb = emb.view(batch_size, self.num_group, self.group_size, emb_dim).contiguous()
         # normalize
         if normalize:
             neighborhood = neighborhood - center.unsqueeze(2)
@@ -203,11 +204,11 @@ class Encoder(nn.Module):
         super().__init__()
         self.encoder_channel = encoder_channel
         self.first_conv_f = nn.Sequential(
-            nn.Conv1d(3, 128, 1),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(3, emb_dim, 1),
+            nn.BatchNorm1d(emb_dim),
             nn.ReLU(inplace=True),
         )
-        self.first_conv_s = nn.Conv1d(128, 256, 1)
+        self.first_conv_s = nn.Conv1d(emb_dim, 256, 1)
         self.second_conv = nn.Sequential(
             nn.Conv1d(512, 512, 1),
             nn.BatchNorm1d(512),
@@ -222,7 +223,7 @@ class Encoder(nn.Module):
         '''
         bs, g, n , _ = point_groups.shape
         point_groups = point_groups.reshape(bs * g, n, 3)
-        emb_groups = emb_groups.reshape(bs*g, n, 128).transpose(2, 1)
+        emb_groups = emb_groups.reshape(bs*g, n, emb_dim).transpose(2, 1)
         # encoder
         feature = self.first_conv_f(point_groups.transpose(2,1))  # BG 256 n
         feature_we = feature + emb_groups
@@ -257,7 +258,7 @@ class Decoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.xyz_head = nn.Conv1d(512, 3, 1)
-        self.emb_head = nn.Conv1d(512, 128, 1)
+        self.emb_head = nn.Conv1d(512, emb_dim, 1)
         a = torch.linspace(-0.05, 0.05, steps=self.grid_size, dtype=torch.float).view(1, self.grid_size).expand(self.grid_size, self.grid_size).reshape(1, -1)
         b = torch.linspace(-0.05, 0.05, steps=self.grid_size, dtype=torch.float).view(self.grid_size, 1).expand(self.grid_size, self.grid_size).reshape(1, -1)
         self.folding_seed = torch.cat([a, b], dim=0).view(1, 2, self.grid_size ** 2) # 1 2 S
@@ -292,7 +293,7 @@ class Decoder(nn.Module):
         fine = self.xyz_head(out) + center   # BG 3 N
         fine = fine.reshape(bs, g, 3, self.num_fine).transpose(-1, -2)
         fine_emb = self.emb_head(out)
-        fine_emb = fine_emb.reshape(bs, g, 128, self.num_fine).transpose(-1, -2)
+        fine_emb = fine_emb.reshape(bs, g, emb_dim, self.num_fine).transpose(-1, -2)
         coarse = coarse.reshape(bs, g, self.num_coarse, 3)
         return coarse, fine, fine_emb
 

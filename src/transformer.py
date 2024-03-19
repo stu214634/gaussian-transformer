@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.loss_utils import ssim
+
 from .gaussians import GaussianModel, render
 from gaussian_renderer import network_gui
 from scene.cameras import Camera
@@ -15,7 +17,9 @@ from timm.models.layers import DropPath,trunc_normal_
 import os
 from chamfer_distance import chamfer_distance as chd
 from torch.utils.tensorboard import SummaryWriter
+import lpips
 N_QUERY = 4096//2
+emb_dim = 128
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -191,9 +195,9 @@ class PCTransformer(nn.Module):
         self.num_features = self.embed_dim = embed_dim
         cfg = DVAEConfig(64, N_QUERY, 256, 8192, 256, 256)
         self.dvae = DiscreteVAE(cfg).cuda()
-        self.dvae.load_state_dict(torch.load(dvae_path))
+        #self.dvae.load_state_dict(torch.load(dvae_path))
         self.vis_embed = VisEmbedNet().cuda()
-        self.vis_embed.load_state_dict(torch.load(tokenizer_path))
+        #self.vis_embed.load_state_dict(torch.load(tokenizer_path))
 
         self.pos_embed = nn.Sequential(
             nn.Linear(3, embed_dim),
@@ -250,13 +254,13 @@ class PCTransformer(nn.Module):
     def detokenize(self, tokens, center):
         _, fine, fine_emb = self.dvae.decode(tokens, center)
         fine_whole = (fine + center.unsqueeze(2)).reshape(-1, 3)
-        return self.vis_embed.decode(fine_emb.reshape(-1, 128), fine_whole)
+        return self.vis_embed.decode(fine_emb.reshape(-1, emb_dim), fine_whole)
     
-    def forward(self, neighborhood, center, n_emb):
+    def forward(self, neighborhood, center, n_emb, temp):
         logits, center, neighborhood, n_emb = self.dvae.encode(neighborhood, center, n_emb)
-        pos = self.pos_embed(center.detach())
-        one_hot = F.gumbel_softmax(logits, 1, dim=-1)
-        tokens = torch.einsum('b g n, n c -> b g c', one_hot, self.vocab).detach()
+        pos = self.pos_embed(center)
+        one_hot = F.gumbel_softmax(logits, temp, dim=-1)
+        tokens = torch.einsum('b g n, n c -> b g c', one_hot, self.vocab)
         mem = tokens
         for module in self.encoder:
             mem = module(mem + pos)
@@ -272,11 +276,12 @@ class PCTransformer(nn.Module):
         for blk in self.decoder:
             q = blk(q, mem)
         
-        pred_logits = F.gumbel_softmax(self.dict_increase(q), tau=1, dim=-1)
-        pred_tokens = torch.einsum('b g n, n c -> b g c', pred_logits, self.vocab)
+        p_logits = self.dict_increase(q)
+        s_o_h = F.gumbel_softmax(p_logits, tau=1, dim=-1)
+        pred_tokens = torch.einsum('b g n, n c -> b g c', s_o_h, self.vocab)
 
         gaussians = self.detokenize(pred_tokens, coarse_point_cloud)
-        return coarse_point_cloud, pred_logits, pred_tokens, gaussians
+        return coarse_point_cloud, logits, p_logits, gaussians
 
 class Pipe():
     def __init__(self):
@@ -284,6 +289,40 @@ class Pipe():
         self.compute_cov3D_python = False
         self.debug = False
 
+def compute_loss(loss_1, loss_2, niter, train_writer):
+    '''
+    compute the final loss for optimization
+    For dVAE: loss_1 : reconstruction loss, loss_2 : kld loss
+    '''
+    start = 0
+    target = 0.1
+    ntime = 100_000
+
+    _niter = niter - 1_000
+    if _niter > ntime:
+        kld_weight = target
+    elif _niter < 0:
+        kld_weight = 0.
+    else:
+        kld_weight = target + (start - target) *  (1. + math.cos(math.pi * float(_niter) / ntime)) / 2.
+
+    if train_writer is not None:
+        train_writer.add_scalar('Loss/Batch/KLD_Weight', kld_weight, niter)
+
+    loss = loss_1 + kld_weight * loss_2
+
+    return loss
+
+def get_temp(niter):
+    start = 1
+    target = 0.0625
+    ntime = 100_000
+    if niter > ntime:
+        return target
+    else:
+        temp = target + (start - target) *  (1. + math.cos(math.pi * float(niter) / ntime)) / 2.
+        return temp
+    
 def train(gaussians : GaussianModel, cameras : List[Camera], path="GaussianTr.pt"):
     transformer = PCTransformer().cuda()
     if os.path.exists(path):
@@ -291,28 +330,25 @@ def train(gaussians : GaussianModel, cameras : List[Camera], path="GaussianTr.pt
         transformer.load_state_dict(torch.load(path))
     else:
         print("Initializing from scratch")
+
     opt = torch.optim.AdamW(transformer.parameters(), 0.0001)
+    #p_loss = lpips.LPIPS().cuda()
 
     network_gui.init("127.0.0.1", 6009)
     pipe = Pipe()
     bg = torch.Tensor([0,0,0]).cuda()
     chamferDist = chd.ChamferDistance()
-    train_writer = SummaryWriter("GaussianTr/Full_Fill")
+    train_writer = SummaryWriter("GaussianTr/Eval")
     group_div = Group(N_QUERY//2, 64)
     gaussians.box_sort(40)
     gaussians_count = gaussians.xyz.shape[0]
     to_predict = gaussians_count//2
-    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=10, cooldown=10)
-    #lr = scheduler.optimizer.param_groups[0]['lr']
     step = 0
     for epoch in range(0, 100_000, 1):
-
-
+        if step > 100_000:
+            break
         for cam in cameras:
-        #t_pts = pts.squeeze()[mask, :]
-        #t_pts = t_pts.view(to_predict, 3).contiguous()
-        #t_emb = vis_embed.squeeze()[mask, :]
-        #t_emb = t_emb.view(to_predict, 128).contiguous()
+            temp = get_temp(step)
             with torch.no_grad():
                 mask = torch.ones(gaussians_count, dtype=torch.bool)
                 start = torch.randint(gaussians_count - to_predict, (1,))[0]
@@ -333,35 +369,57 @@ def train(gaussians : GaussianModel, cameras : List[Camera], path="GaussianTr.pt
             #c_true = center.detach()
             #n_emb_true = emb.detach()
 
-            _, _, _, pred_gaussians = transformer.forward(n_in, c_in, n_emb_in)
+            _, pred_logits, _, pred_gaussians = transformer.forward(n_in, c_in, n_emb_in, temp)
+
+            # Position loss
             d1, d2, _, idx2 = chamferDist(target_gaussians.xyz.unsqueeze(0), pred_gaussians.xyz.unsqueeze(0))
             xyz_loss = torch.mean(d1)*0.5 + torch.mean(d2)*0.5
-            with torch.no_grad():
-                tgt_gaussians = target_gaussians.get_idx(idx2.squeeze())
-            scaling_loss = F.mse_loss(tgt_gaussians.scaling, pred_gaussians.scaling)
-            rotation_loss = F.mse_loss(tgt_gaussians.rotation, pred_gaussians.rotation)
-            shs_loss = F.mse_loss(tgt_gaussians.shs, pred_gaussians.shs)
-            opacity_loss = F.mse_loss(tgt_gaussians.opacity, pred_gaussians.opacity)
-            other_loss = xyz_loss + scaling_loss + rotation_loss + shs_loss + opacity_loss
+
+            # # Get Gaussian Neighbor
+            # with torch.no_grad():
+            #     tgt_gaussians = target_gaussians.get_idx(idx2.squeeze())
+
+            # # MSE with closest
+            # scaling_loss = F.mse_loss(tgt_gaussians.scaling, pred_gaussians.scaling)
+            # rotation_loss = F.mse_loss(tgt_gaussians.rotation, pred_gaussians.rotation)
+            # shs_loss = F.mse_loss(tgt_gaussians.shs, pred_gaussians.shs)
+            # opacity_loss = F.mse_loss(tgt_gaussians.opacity, pred_gaussians.opacity)
+            # other_loss = xyz_loss + scaling_loss + rotation_loss + shs_loss + opacity_loss
+
+            recon_loss = xyz_loss
             im_loss = torch.scalar_tensor(0, dtype=torch.float32).cuda()
-            loss = other_loss
-            if other_loss <= 1:
-                pred_im = render(cam, pred_gaussians, pipe, bg, 1)["render"]
-                target_im = render(cam, target_gaussians, pipe, bg, 1)["render"].detach()
-                im_loss += F.l1_loss(pred_im, target_im)
-                loss += im_loss
+            pred_im = render(cam, pred_gaussians, pipe, bg, 1)["render"]
+            target_im = render(cam, target_gaussians, pipe, bg, 1)["render"].detach()
+            im_loss += F.l1_loss(pred_im, target_im)
+            #im_lpips = p_loss(torch.clamp(pred_im, 0, 1) * 2 - 1, torch.clamp(target_im, 0, 1) * 2 - 1).squeeze()
+            dssim = 1-ssim(pred_im, target_im, 1).squeeze()
+            recon_loss += im_loss + dssim
+
+            #KLV Divergence Loss
+            softmax = F.softmax(pred_logits, dim=-1)
+            mean_softmax = softmax.mean(dim=1)
+            log_qy = torch.log(mean_softmax)
+            log_uniform = torch.log(torch.tensor([1. / 8192], device = "cuda"))
+            klv_loss = F.kl_div(log_qy, log_uniform.expand(log_qy.size(0), log_qy.size(1)), None, None, 'batchmean', log_target = True)
+            
+            loss = compute_loss(recon_loss, klv_loss, step, train_writer)
             loss.backward()
+
             opt.step()
             opt.zero_grad()
 
             with torch.no_grad():
                 train_writer.add_scalar("loss", loss.data.item(), step)
+                train_writer.add_scalar("recon_loss", recon_loss.data.item(), step)
+                train_writer.add_scalar("kl_loss", klv_loss.data.item(), step)
                 train_writer.add_scalar("xyz_loss", xyz_loss.data.item(), step)
-                train_writer.add_scalars("mse_losses", {"scaling_loss": scaling_loss.data.item(),
-                                        "rotation_loss": rotation_loss.data.item(),
-                                        "shs_loss": shs_loss.data.item(),
-                                        "opacity_loss": opacity_loss.data.item()}, step)
+                # train_writer.add_scalars("mse_losses", {"scaling_loss": scaling_loss.data.item(),
+                #                         "rotation_loss": rotation_loss.data.item(),
+                #                         "shs_loss": shs_loss.data.item(),
+                #                         "opacity_loss": opacity_loss.data.item()}, step)
                 train_writer.add_scalar("im_loss", im_loss.data.item(), step)
+                #train_writer.add_scalar("perceptive_loss", im_lpips.data.item(), step)
+                train_writer.add_scalar("dssim", dssim.data.item(), step)
                 step += 1
                 first = True
                 if network_gui.conn == None:
@@ -431,13 +489,13 @@ def test(gaussians : GaussianModel):
     t_neighborhood = pts.squeeze()[mask, :]
     t_neighborhood = t_neighborhood.view(to_predict, 3).contiguous()
     t_emb = vis_embed.squeeze()[mask, :]
-    t_emb = t_emb.view(to_predict, 128).contiguous()
+    t_emb = t_emb.view(to_predict, emb_dim).contiguous()
     nidx = ~mask
     print(nidx[nidx].shape[0])
     i_neighborhood = pts.squeeze()[nidx, :]
     i_neighborhood = i_neighborhood.view(pts.shape[0]-to_predict, 3).contiguous()
     i_emb = vis_embed.squeeze()[nidx, :]
-    i_emb = i_emb.view(pts.shape[0]-to_predict, 128).contiguous()
+    i_emb = i_emb.view(pts.shape[0]-to_predict, emb_dim).contiguous()
     vis_embed = vis_embed.detach()
     pts = pts.detach()
     neighborhood, center, emb = group_div(i_neighborhood.unsqueeze(0), i_emb.unsqueeze(0), normalize=False)
@@ -451,7 +509,7 @@ def test(gaussians : GaussianModel):
                 if custom_cam != None:
                     ret = transformer.dvae(neighborhood, center, emb, hard=True)
                     whole_coarse, whole_fine, coarse, fine, fine_emb, n_emb, neighborhood, logits = ret
-                    g_in = transformer.vis_embed.decode(fine_emb.reshape(-1, 128), whole_fine.reshape(-1, 3))
+                    g_in = transformer.vis_embed.decode(fine_emb.reshape(-1, emb_dim), whole_fine.reshape(-1, 3))
                     g_render=g_in
                     net_image = render(custom_cam, g_render, pipe, bg, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())

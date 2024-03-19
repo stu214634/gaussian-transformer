@@ -1,12 +1,13 @@
 import copy
 import torch
+import math
 from torch import nn
 from torch.nn import functional as F
 from .attention import MultiHeadedAttention
 from .encoder import Encoder, EncoderLayer
 from .decoder import Decoder, DecoderLayer
 from .shared import Embeddings, PositionwiseFeedForward
-
+from torch.autograd import Variable
 
 class EncoderDecoder(nn.Module):
     """
@@ -42,6 +43,26 @@ class Generator(nn.Module):
     def forward(self, x):
         return self.proj(x)
     
+class PositionalEncoding(nn.Module):
+    "Implement the PE function."
+    def __init__(self, d_model, dropout, max_len=4_000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) *
+                             -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        x = x + Variable(self.pe[:, :x.size(1)], 
+                         requires_grad=False)
+        return self.dropout(x)
 
 def make_model(stacking, src_g_len=64, tgt_g_len=64, N=2, 
                d_model=32, h=8, dropout=0.1):
@@ -49,12 +70,13 @@ def make_model(stacking, src_g_len=64, tgt_g_len=64, N=2,
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
     ff = PositionwiseFeedForward(d_model, d_model*2, dropout)
+    position = PositionalEncoding(d_model=d_model, dropout=dropout)
     model = EncoderDecoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
         Decoder(DecoderLayer(d_model, c(attn), c(attn), 
                              c(ff), dropout), N),
-                                            c(ff),
-                                            c(ff),
+                                            c(position),
+                                            c(position),
         Generator(d_model, tgt_g_len))
     
     # This was important from their code. 

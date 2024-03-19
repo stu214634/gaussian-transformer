@@ -10,6 +10,8 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from torch.autograd import Function
 from torch.utils.tensorboard import SummaryWriter
 
+emb_dim = 128
+
 class _TruncExp(Function):  # pylint: disable=abstract-method
     # Implementation from torch-ngp:
     # https://github.com/ashawkey/torch-ngp/blob/93b08a0d4ec1cc6e69d85df7f0acdfb99603b628/activation.py
@@ -31,10 +33,10 @@ inverse_sigmoid = lambda x: np.log(x / (1 - x))
 class MLP(nn.Module):
     def __init__(
         self,
-        dim_in: int = 128,
-        dim_out: int = 128,
+        dim_in: int = emb_dim,
+        dim_out: int = emb_dim,
         n_neurons: int = 256,
-        n_hidden_layers: int = 2,
+        n_hidden_layers: int = 3,
         activation: str = "silu",
         bias: bool = True,
     ):
@@ -78,7 +80,7 @@ class MLP(nn.Module):
             raise NotImplementedError
         
 class GSLayerOut(nn.Module):
-    in_channels: int = 128
+    in_channels: int = emb_dim
     init_scaling: float = -5.0
     init_density: float = 0.1
     keys = ["shs", "scaling", "rotation", "opacity"]
@@ -111,7 +113,7 @@ class GSLayerOut(nn.Module):
                 v = torch.nn.functional.normalize(v)
             elif k == "scaling":
                 v = trunc_exp(v)    
-                v = torch.clamp(v, min=0, max=0.2)
+                v = torch.clamp(v, min=0, max=0.05)
             elif k == "opacity":
                 v = torch.sigmoid(v)
             elif k == "shs":
@@ -123,7 +125,7 @@ class GSLayerOut(nn.Module):
         return GaussianModel(**ret)
     
 class GSLayerIn(nn.Module):
-    out_channels: int = 128
+    out_channels: int = emb_dim
     keys = ["shs", "scaling", "rotation", "opacity"]
     in_ch = [12, 3, 4, 1]
     def __init__(self) -> None:
@@ -171,7 +173,7 @@ class VisEmbedNet(nn.Module):
 
 def train(gaussians, cameras, pipe, bg):
     model = VisEmbedNet().cuda()
-    optimizer = torch.optim.Adam(model.parameters(), 0.0001)
+    optimizer = torch.optim.AdamW(model.parameters(), 0.0001)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, cooldown=5)
     writer = SummaryWriter(f'VisEmbedLog/')
     step = 0
